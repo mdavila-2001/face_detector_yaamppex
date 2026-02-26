@@ -216,3 +216,19 @@ models/*.onnx
 *.jpg
 *.png
 *.jpeg
+firebase_credentials.json
+.env/
+__pycache__/
+.DS_Store
+
+# Virtual Environments
+venv/
+env/
+
+# AI Models (large files)
+models/*.onnx
+
+# Test images
+*.jpg
+*.png
+*.jpeg
