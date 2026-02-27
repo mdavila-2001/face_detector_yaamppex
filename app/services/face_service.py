@@ -13,12 +13,14 @@ from google.cloud import firestore
 # ==========================================
 # A. Modelo de Identidad (InsightFace - Solo Detección y Landmarks)
 face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CPUExecutionProvider'])
+#face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CUDAExecutionProvider'])
 face_app.prepare(ctx_id=0, det_size=(640, 640))
 
 # B. Modelo Anti-Spoofing / Liveness (MiniFASNet)
 ruta_liveness = "models/modelrgb.onnx"
 try:
     liveness_session = ort.InferenceSession(ruta_liveness, providers=['CPUExecutionProvider'])
+    #liveness_session = ort.InferenceSession(ruta_liveness, providers=['CUDAExecutionProvider'])
     liveness_input_name = liveness_session.get_inputs()[0].name
 except Exception as e:
     print(f"⚠️ Error cargando modelo Liveness: {e}")
@@ -27,6 +29,7 @@ except Exception as e:
 ruta_arcface = "models/arcfaceresnet100-8.onnx"
 try:
     arcface_session = ort.InferenceSession(ruta_arcface, providers=['CPUExecutionProvider'])
+    #arcface_session = ort.InferenceSession(ruta_arcface, providers=['CUDAExecutionProvider'])
     arcface_input_name = arcface_session.get_inputs()[0].name
 except Exception as e:
     print(f"⚠️ Error cargando modelo ArcFace: {e}")
@@ -39,86 +42,75 @@ LIVENESS_THRESHOLD = 0.85    # 85% de certeza mínima de que está vivo
 # 2. FUNCIONES SINCRONAS (Trabajo pesado CPU)
 # ==========================================
 def _analizar_rostro_completo(photo_bytes: bytes):
-    """
-    Decodifica la imagen, extrae el rostro, verifica Liveness y devuelve el Vector.
-    Todo en un solo flujo optimizado.
-    """
     nparr = np.frombuffer(photo_bytes, np.uint8)
     img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
-    if img_bgr is None:
-        raise ValueError("No se pudo decodificar la imagen.")
+    if img_bgr is None: raise ValueError("No se pudo decodificar la imagen.")
 
-    # 1. Detectar el rostro y extraer features con InsightFace
+    # 1. Detectar el rostro (Radar)
     faces = face_app.get(img_bgr)
-    
-    if len(faces) == 0:
-        raise ValueError("No se detectó ningún rostro.")
-    if len(faces) > 1:
-        raise ValueError("Se detectó más de un rostro. Solo debe haber una persona.")
+    if len(faces) == 0: raise ValueError("No se detectó ningún rostro.")
+    if len(faces) > 1: raise ValueError("Se detectó más de un rostro. Solo debe haber una persona.")
         
     face = faces[0]
-    bbox = face.bbox # Coordenadas: [x1, y1, x2, y2]
+    bbox = face.bbox
     
-    # === 2A. Recortar e inferir Reconocimiento Facial (ArcFace MIT) ===
-    # InsightFace nos da los 5 puntos clave (ojos, nariz, comisuras) en face.kps
-    if face.kps is None:
-        raise ValueError("No se encontraron puntos de referencia (landmarks) en el rostro.")
-    
-    # norm_crop alinea matemáticamente la cara basándose en los landmarks
-    rostro_alineado = norm_crop(img_bgr, landmark=face.kps, image_size=112)
-    
-    # Preparar el tensor para ArcFace (espera RGB, float32, y normalizado ((pixels - 127.5) / 127.5))
-    arcface_rgb = cv2.cvtColor(rostro_alineado, cv2.COLOR_BGR2RGB)
-    arcface_tensor = np.transpose(arcface_rgb, (2, 0, 1)) # (3, 112, 112)
-    arcface_tensor = np.expand_dims(arcface_tensor, axis=0) # (1, 3, 112, 112)
-    arcface_tensor = (arcface_tensor.astype(np.float32) - 127.5) / 127.5
-    
-    # Ejecutar ArcFace
-    resultado_arcface = arcface_session.run(None, {arcface_input_name: arcface_tensor})
-    embedding = [float(x) for x in resultado_arcface[0][0]] # Vector de 512 dimensiones
-    
-    # === 2B. Recortar el rostro para el test de Liveness (expandido) ===
-    # El modelo MiniFASNet necesita contexto (fondo/bordes) para saber si es una foto real o un teléfono.
+    # === 2. TEST DE LIVENESS PRIMERO (Para no gastar recursos si es falso) ===
     alto_img, ancho_img = img_bgr.shape[:2]
-    x1, y1 = int(bbox[0]), int(bbox[1])
-    x2, y2 = int(bbox[2]), int(bbox[3])
+    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
     
-    face_w = x2 - x1
-    face_h = y2 - y1
-    cx = x1 + face_w // 2
-    cy = y1 + face_h // 2
+    face_w, face_h = x2 - x1, y2 - y1
+    cx, cy = x1 + face_w // 2, y1 + face_h // 2
     
-    # Expandimos el recorte un 50% (escala 1.5)
     scale = 1.5
     side = int(max(face_w, face_h) * scale)
     
-    nx1 = max(0, cx - side // 2)
-    ny1 = max(0, cy - side // 2)
-    nx2 = min(ancho_img, cx + side // 2)
-    ny2 = min(alto_img, cy + side // 2)
+    nx1, ny1 = max(0, cx - side // 2), max(0, cy - side // 2)
+    nx2, ny2 = min(ancho_img, cx + side // 2), min(alto_img, cy + side // 2)
     
     rostro_recortado = img_bgr[ny1:ny2, nx1:nx2]
-    
-    if rostro_recortado.size == 0:
-        raise ValueError("Error al recortar el rostro detectado.")
+    if rostro_recortado.size == 0: raise ValueError("Error al recortar el rostro detectado.")
 
-    # 3. Preparar imagen para el modelo Anti-Spoofing (Requiere RGB y 112x112)
-    img_rgb = cv2.cvtColor(rostro_recortado, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (112, 112))
-    
+    img_rgb_liveness = cv2.cvtColor(rostro_recortado, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb_liveness, (112, 112))
     img_normalized = img_resized.astype(np.float32) / 255.0
     img_normalized = np.transpose(img_normalized, (2, 0, 1))
     img_normalized = np.expand_dims(img_normalized, axis=0)
 
-    # 4. Ejecutar Anti-Spoofing
     resultado_liveness = liveness_session.run(None, {liveness_input_name: img_normalized})
-    score_real = float(resultado_liveness[0][0][1]) # Probabilidad de ser "Real"
+    score_real = float(resultado_liveness[0][0][1])
     
-    # 5. Devolvemos el resultado empacado
+    is_real = score_real >= LIVENESS_THRESHOLD
+
+    # Si es una foto de una pantalla o papel, cortamos aquí, no hacemos ArcFace
+    if not is_real:
+        return {
+            "liveness_score": score_real,
+            "is_real": False,
+            "embedding": None
+        }
+
+    # === 3. EXTRACCIÓN DE IDENTIDAD (Solo si pasó el filtro de vida) ===
+    if face.kps is None:
+        raise ValueError("No se encontraron puntos de referencia (landmarks) en el rostro.")
+    
+    rostro_alineado = norm_crop(img_bgr, landmark=face.kps, image_size=112)
+    
+    arcface_rgb = cv2.cvtColor(rostro_alineado, cv2.COLOR_BGR2RGB)
+    arcface_tensor = np.transpose(arcface_rgb, (2, 0, 1))
+    arcface_tensor = np.expand_dims(arcface_tensor, axis=0)
+    arcface_tensor = (arcface_tensor.astype(np.float32) - 127.5) / 127.5
+    
+    resultado_arcface = arcface_session.run(None, {arcface_input_name: arcface_tensor})
+    vector_crudo = resultado_arcface[0][0]
+    
+    # NORMALIZACIÓN L2 (El paso crítico matemático)
+    vector_normalizado = vector_crudo / np.linalg.norm(vector_crudo)
+    embedding = [float(x) for x in vector_normalizado]
+    
     return {
         "liveness_score": score_real,
-        "is_real": score_real >= LIVENESS_THRESHOLD,
+        "is_real": True,
         "embedding": embedding
     }
 
