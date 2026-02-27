@@ -17,8 +17,8 @@ def probar_liveness(ruta_imagen, ruta_modelo="models/modelrgb.onnx"):
     input_shape = session.get_inputs()[0].shape
     
     # Generalmente el shape es [1, 3, alto, ancho]. Extraemos alto y ancho.
-    alto_requerido = input_shape[2] if isinstance(input_shape[2], int) else 80
-    ancho_requerido = input_shape[3] if isinstance(input_shape[3], int) else 80
+    alto_requerido = input_shape[2] if isinstance(input_shape[2], int) else 112
+    ancho_requerido = input_shape[3] if isinstance(input_shape[3], int) else 112
 
     # 2. Leer y preparar la imagen
     img = cv2.imread(ruta_imagen)
