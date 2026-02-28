@@ -8,15 +8,9 @@ from insightface.utils.face_align import norm_crop
 from app.db.firebase import db
 from google.cloud import firestore
 
-# ==========================================
-# 1. INICIALIZACIÓN DE MODELOS EN MEMORIA
-# ==========================================
-# A. Modelo de Identidad (InsightFace - Solo Detección y Landmarks)
 face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CPUExecutionProvider'])
-#face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CUDAExecutionProvider'])
 face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-# B. Modelo Anti-Spoofing / Liveness (MiniFASNet)
 ruta_liveness = "models/modelrgb.onnx"
 try:
     liveness_session = ort.InferenceSession(ruta_liveness, providers=['CPUExecutionProvider'])
@@ -34,20 +28,15 @@ try:
 except Exception as e:
     print(f"⚠️ Error cargando modelo ArcFace: {e}")
 
-# Umbrales de Seguridad
-SIMILARITY_THRESHOLD = 0.48  # Para conductores con variaciones de luz/look
-LIVENESS_THRESHOLD = 0.85    # 85% de certeza mínima de que está vivo
+SIMILARITY_THRESHOLD = 0.48
+LIVENESS_THRESHOLD = 0.85
 
-# ==========================================
-# 2. FUNCIONES SINCRONAS (Trabajo pesado CPU)
-# ==========================================
 def _analizar_rostro_completo(photo_bytes: bytes):
     nparr = np.frombuffer(photo_bytes, np.uint8)
     img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
     if img_bgr is None: raise ValueError("No se pudo decodificar la imagen.")
 
-    # 1. Detectar el rostro (Radar)
     faces = face_app.get(img_bgr)
     if len(faces) == 0: raise ValueError("No se detectó ningún rostro.")
     if len(faces) > 1: raise ValueError("Se detectó más de un rostro. Solo debe haber una persona.")
@@ -55,7 +44,6 @@ def _analizar_rostro_completo(photo_bytes: bytes):
     face = faces[0]
     bbox = face.bbox
     
-    # === 2. TEST DE LIVENESS PRIMERO (Para no gastar recursos si es falso) ===
     alto_img, ancho_img = img_bgr.shape[:2]
     x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
     
@@ -82,7 +70,6 @@ def _analizar_rostro_completo(photo_bytes: bytes):
     
     is_real = score_real >= LIVENESS_THRESHOLD
 
-    # Si es una foto de una pantalla o papel, cortamos aquí, no hacemos ArcFace
     if not is_real:
         return {
             "liveness_score": score_real,
@@ -90,7 +77,6 @@ def _analizar_rostro_completo(photo_bytes: bytes):
             "embedding": None
         }
 
-    # === 3. EXTRACCIÓN DE IDENTIDAD (Solo si pasó el filtro de vida) ===
     if face.kps is None:
         raise ValueError("No se encontraron puntos de referencia (landmarks) en el rostro.")
     
@@ -104,7 +90,6 @@ def _analizar_rostro_completo(photo_bytes: bytes):
     resultado_arcface = arcface_session.run(None, {arcface_input_name: arcface_tensor})
     vector_crudo = resultado_arcface[0][0]
     
-    # NORMALIZACIÓN L2 (El paso crítico matemático)
     vector_normalizado = vector_crudo / np.linalg.norm(vector_crudo)
     embedding = [float(x) for x in vector_normalizado]
     
@@ -119,15 +104,10 @@ def _calcular_similitud(embedding1: list, embedding2: list) -> float:
     dot_product = np.dot(vec1, vec2)
     return float(dot_product / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
 
-# ==========================================
-# 3. ENDPOINTS ASÍNCRONOS (Rutas FastAPI)
-# ==========================================
 async def process_registration(user_id: str, photo_bytes: bytes) -> dict:
     try:
-        # Enviamos el trabajo pesado al hilo secundario
         analisis = await asyncio.to_thread(_analizar_rostro_completo, photo_bytes)
         
-        # FILTRO DE SEGURIDAD 🛡️
         if not analisis["is_real"]:
             db.collection('fraud_attempts').add({
                 'user_id': user_id, 'action': 'register', 
@@ -135,7 +115,6 @@ async def process_registration(user_id: str, photo_bytes: bytes) -> dict:
             })
             raise HTTPException(status_code=403, detail="Alerta de Seguridad: Se detectó un posible ataque de suplantación (Spoofing).")
 
-        # Guardar en Firebase
         driver_ref = db.collection('drivers').document(user_id)
         driver_ref.set({
             'status': 'registered',
@@ -159,7 +138,6 @@ async def process_registration(user_id: str, photo_bytes: bytes) -> dict:
 
 async def process_verification(user_id: str, photo_bytes: bytes) -> dict:
     try:
-        # 1. Recuperar vector de Firebase
         driver_ref = db.collection('drivers').document(user_id)
         doc = driver_ref.get()
         if not doc.exists:
@@ -169,10 +147,8 @@ async def process_verification(user_id: str, photo_bytes: bytes) -> dict:
         if not saved_embedding:
             raise HTTPException(status_code=400, detail="El usuario no tiene un rostro registrado.")
             
-        # 2. Analizar foto actual
         analisis = await asyncio.to_thread(_analizar_rostro_completo, photo_bytes)
         
-        # FILTRO DE SEGURIDAD 🛡️
         if not analisis["is_real"]:
             db.collection('fraud_attempts').add({
                 'user_id': user_id, 'action': 'verify', 
@@ -180,7 +156,6 @@ async def process_verification(user_id: str, photo_bytes: bytes) -> dict:
             })
             raise HTTPException(status_code=403, detail="Acceso Denegado: Prueba de vida fallida.")
         
-        # 3. Comparar matemáticamente
         similarity = _calcular_similitud(saved_embedding, analisis["embedding"])
         is_verified = similarity >= SIMILARITY_THRESHOLD
         
