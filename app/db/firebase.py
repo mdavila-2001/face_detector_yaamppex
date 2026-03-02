@@ -11,7 +11,9 @@ def get_db():
             raise RuntimeError(f"Falta el archivo de credenciales en: {cred_path}")
             
         cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred)
+        firebase_admin.initialize_app(cred, {
+            'storageBucket': 'prueba-82a5e.firebasestorage.app'
+        })
     
     return firestore.client()
 

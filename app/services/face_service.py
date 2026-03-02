@@ -7,6 +7,8 @@ from insightface.app import FaceAnalysis
 from insightface.utils.face_align import norm_crop
 from app.db.firebase import db
 from google.cloud import firestore
+import uuid
+from firebase_admin import storage
 
 face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CPUExecutionProvider'])
 face_app.prepare(ctx_id=0, det_size=(640, 640))
@@ -104,77 +106,120 @@ def _calcular_similitud(embedding1: list, embedding2: list) -> float:
     dot_product = np.dot(vec1, vec2)
     return float(dot_product / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
 
-async def process_registration(user_id: str, photo_bytes: bytes) -> dict:
+async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
     try:
+        # 1. Analizar la foto en vivo (Liveness + Extracción del Vector)
         analisis = await asyncio.to_thread(_analizar_rostro_completo, photo_bytes)
         
+        # Si es una foto a una pantalla/papel, bloqueamos al instante
         if not analisis["is_real"]:
             db.collection('fraud_attempts').add({
-                'user_id': user_id, 'action': 'register', 
-                'liveness_score': analisis["liveness_score"], 'timestamp': firestore.SERVER_TIMESTAMP
+                'document_number': document_number, 
+                'action': 'smart_auth', 
+                'liveness_score': analisis["liveness_score"], 
+                'timestamp': firestore.SERVER_TIMESTAMP
             })
-            raise HTTPException(status_code=403, detail="Alerta de Seguridad: Se detectó un posible ataque de suplantación (Spoofing).")
+            raise HTTPException(status_code=403, detail="Alerta de Seguridad: Prueba de vida fallida (Posible Spoofing).")
 
-        driver_ref = db.collection('drivers').document(user_id)
-        driver_ref.set({
-            'status': 'registered',
-            'face_embedding': analisis["embedding"],
-            'created_at': firestore.SERVER_TIMESTAMP
-        })
+        workers_ref = db.collection('trabajadores')
+        user_doc = None
+        user_id = None
         
-        return {
-            "status": "success",
-            "message": f"Conductor {user_id} registrado exitosamente.",
-            "embedding_size": len(analisis["embedding"]),
-            "liveness_score": round(analisis["liveness_score"], 4)
-        }
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
-
-
-async def process_verification(user_id: str, photo_bytes: bytes) -> dict:
-    try:
-        driver_ref = db.collection('drivers').document(user_id)
-        doc = driver_ref.get()
-        if not doc.exists:
-            raise HTTPException(status_code=404, detail="Usuario no encontrado. Debe registrarse.")
-            
-        saved_embedding = doc.to_dict().get('face_embedding')
-        if not saved_embedding:
-            raise HTTPException(status_code=400, detail="El usuario no tiene un rostro registrado.")
-            
-        analisis = await asyncio.to_thread(_analizar_rostro_completo, photo_bytes)
+        # 2. Búsqueda en cascada: Primero por CI
+        query_ci = workers_ref.where('ci', '==', document_number).get()
         
-        if not analisis["is_real"]:
-            db.collection('fraud_attempts').add({
-                'user_id': user_id, 'action': 'verify', 
-                'liveness_score': analisis["liveness_score"], 'timestamp': firestore.SERVER_TIMESTAMP
-            })
-            raise HTTPException(status_code=403, detail="Acceso Denegado: Prueba de vida fallida.")
-        
-        similarity = _calcular_similitud(saved_embedding, analisis["embedding"])
-        is_verified = similarity >= SIMILARITY_THRESHOLD
-        
-        if is_verified:
-            driver_ref.update({
-                'last_verified': firestore.SERVER_TIMESTAMP,
-                'status': 'active'
-            })
-            mensaje = "Acceso permitido por 24 horas."
+        if len(query_ci) > 0:
+            user_doc = query_ci[0]
+            user_id = user_doc.id
         else:
-            mensaje = "Denegado. El rostro no coincide con el conductor registrado."
+            # 3. Si no existe por CI, buscamos por Pasaporte
+            query_pasaporte = workers_ref.where('pasaporte', '==', document_number).get()
+            if len(query_pasaporte) > 0:
+                user_doc = query_pasaporte[0]
+                user_id = user_doc.id
+
+        # 4. LÓGICA DE DECISIÓN (Crear vs Verificar)
+        if not user_doc:
+            # ESCENARIO A: EL USUARIO NO EXISTE -> LO CREAMOS
             
-        return {
-            "status": "success" if is_verified else "failed",
-            "message": mensaje,
-            "verified": is_verified,
-            "similarity_score": round(similarity, 4),
-            "liveness_score": round(analisis["liveness_score"], 4)
-        }
+            # --- NUEVO: Subir foto a Firebase Storage ---
+            bucket = storage.bucket()
+            # Creamos un nombre único para la foto
+            nombre_archivo = f"fotos_perfil/{document_number}_{uuid.uuid4().hex[:8]}.jpg"
+            blob = bucket.blob(nombre_archivo)
+            
+            # Subimos los bytes que llegaron desde Flutter
+            blob.upload_from_string(photo_bytes, content_type='image/jpeg')
+            blob.make_public() # Hacemos la URL pública para que la app pueda leerla
+            photo_url = blob.public_url
+            # --------------------------------------------
+
+            # Dejamos el () vacío para que Firebase genere el ID aleatorio por default
+            new_user_ref = workers_ref.document() 
+            
+            new_user_ref.set({
+                'ci': document_number, # Guardamos el CI como un campo interno
+                'status': 'active',
+                'face_embedding': analisis["embedding"],
+                'created_at': firestore.SERVER_TIMESTAMP,
+                'perfil': {
+                    'photoUrl': photo_url, # Guardamos el link de Storage
+                    'createdAt': firestore.SERVER_TIMESTAMP
+                }
+            }, merge=True)
+            
+            return {
+                "status": "success",
+                "action": "registered",
+                "message": f"Usuario creado exitosamente con ID automático.",
+                "verified": True,
+                "similarity_score": 1.0,
+                "liveness_score": round(analisis["liveness_score"], 4)
+            }
+            
+        else:
+            # ESCENARIO B: EL USUARIO SÍ EXISTE -> VERIFICAMOS EL ROSTRO
+            user_data = user_doc.to_dict()
+            saved_embedding = user_data.get('face_embedding')
+            
+            # Sub-escenario B1: Existe en la BD pero no tiene biometría previa (Sincronización)
+            if not saved_embedding:
+                workers_ref.document(user_id).set({
+                    'face_embedding': analisis["embedding"],
+                    'updated_at': firestore.SERVER_TIMESTAMP
+                }, merge=True)
+                
+                return {
+                    "status": "success",
+                    "action": "biometrics_updated",
+                    "message": "Usuario encontrado, pero no tenía rostro registrado. Biometría guardada exitosamente.",
+                    "verified": True,
+                    "similarity_score": 1.0,
+                    "liveness_score": round(analisis["liveness_score"], 4)
+                }
+                
+            # Sub-escenario B2: Ya tiene biometría -> Hacemos el Match Matemático
+            similarity = _calcular_similitud(saved_embedding, analisis["embedding"])
+            is_verified = similarity >= SIMILARITY_THRESHOLD
+            
+            if is_verified:
+                workers_ref.document(user_id).set({
+                    'last_verified': firestore.SERVER_TIMESTAMP,
+                    'status': 'active'
+                }, merge=True)
+                mensaje = "Verificación exitosa. El rostro coincide con el documento."
+            else:
+                mensaje = "Acceso Denegado. El rostro no coincide con el dueño de este documento."
+                
+            return {
+                "status": "success" if is_verified else "failed",
+                "action": "verified",
+                "message": mensaje,
+                "verified": is_verified,
+                "similarity_score": round(similarity, 4),
+                "liveness_score": round(analisis["liveness_score"], 4)
+            }
+
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except HTTPException as he:
