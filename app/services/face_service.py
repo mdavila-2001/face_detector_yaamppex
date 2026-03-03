@@ -140,38 +140,36 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
 
         # 4. LÓGICA DE DECISIÓN (Crear vs Verificar)
         if not user_doc:
-            # ESCENARIO A: EL USUARIO NO EXISTE -> LO CREAMOS
+            # ESCENARIO A: EL USUARIO NO EXISTE -> LO CREAMOS EN BORRADOR (Lazy Registration)
             
-            # --- NUEVO: Subir foto a Firebase Storage ---
+            new_user_ref = workers_ref.document() # Generamos el documento vacío
+            new_user_id = new_user_ref.id # ¡Capturamos el ID generado!
+            
+            # --- Subir foto a Firebase Storage ---
             bucket = storage.bucket()
-            # Creamos un nombre único para la foto
             nombre_archivo = f"fotos_perfil/{document_number}_{uuid.uuid4().hex[:8]}.jpg"
             blob = bucket.blob(nombre_archivo)
-            
-            # Subimos los bytes que llegaron desde Flutter
             blob.upload_from_string(photo_bytes, content_type='image/jpeg')
-            blob.make_public() # Hacemos la URL pública para que la app pueda leerla
+            blob.make_public() 
             photo_url = blob.public_url
             # --------------------------------------------
 
-            # Dejamos el () vacío para que Firebase genere el ID aleatorio por default
-            new_user_ref = workers_ref.document() 
-            
             new_user_ref.set({
-                'ci': document_number, # Guardamos el CI como un campo interno
-                'status': 'active',
+                'ci': document_number,
+                'estadoTrabajador': 'incompleto', # 🔒 CANDADO: No puede operar aún
                 'face_embedding': analisis["embedding"],
                 'created_at': firestore.SERVER_TIMESTAMP,
                 'perfil': {
-                    'photoUrl': photo_url, # Guardamos el link de Storage
+                    'photoUrl': photo_url, 
                     'createdAt': firestore.SERVER_TIMESTAMP
                 }
             }, merge=True)
             
             return {
                 "status": "success",
-                "action": "registered",
-                "message": f"Usuario creado exitosamente con ID automático.",
+                "action": "created_pending_kyc", # Le avisamos a Flutter que falta info
+                "user_id": new_user_id, # Le pasamos el ID para que Flutter sepa a quién actualizar
+                "message": "Perfil base creado. Por favor complete sus datos y documentos.",
                 "verified": True,
                 "similarity_score": 1.0,
                 "liveness_score": round(analisis["liveness_score"], 4)
@@ -226,3 +224,61 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+
+async def process_kyc_update(
+    user_id: str, 
+    nombres: str, 
+    apellidos: str, 
+    ci_front: bytes, 
+    ci_back: bytes, 
+    passport_front: bytes, 
+    passport_back: bytes
+) -> dict:
+    try:
+        workers_ref = db.collection('trabajadores')
+        worker_doc = workers_ref.document(user_id)
+        
+        # 1. Verificamos que el "borrador" exista realmente
+        doc_snapshot = worker_doc.get()
+        if not doc_snapshot.exists:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado en el sistema.")
+
+        bucket = storage.bucket()
+
+        # 2. Función auxiliar interna para no repetir código al subir fotos
+        def upload_document_image(image_bytes: bytes, doc_type: str) -> str:
+            nombre_archivo = f"documentos_kyc/{user_id}/{doc_type}_{uuid.uuid4().hex[:8]}.jpg"
+            blob = bucket.blob(nombre_archivo)
+            blob.upload_from_string(image_bytes, content_type='image/jpeg')
+            blob.make_public()
+            return blob.public_url
+
+        # 3. Subimos las 4 fotos a Firebase Storage de forma concurrente
+        # Se guardarán ordenadas en una carpeta con el ID del usuario
+        url_ci_front, url_ci_back, url_passport_front, url_passport_back = await asyncio.gather(
+            asyncio.to_thread(upload_document_image, ci_front, "ci_anverso"),
+            asyncio.to_thread(upload_document_image, ci_back, "ci_reverso"),
+            asyncio.to_thread(upload_document_image, passport_front, "pasaporte_anverso"),
+            asyncio.to_thread(upload_document_image, passport_back, "pasaporte_reverso")
+        )
+
+        # 4. Actualizamos la base de datos (Quitamos el candado)
+        worker_doc.update({
+            'estadoTrabajador': 'activo', # 🟢 ¡Usuario liberado para trabajar!
+            'perfil.name': f"{nombres} {apellidos}", # Usamos dot notation para actualizar dentro del mapa 'perfil'
+            'documentos': {
+                'ci_anverso': url_ci_front,
+                'ci_reverso': url_ci_back,
+                'pasaporte_anverso': url_passport_front,
+                'pasaporte_reverso': url_passport_back,
+                'uploaded_at': firestore.SERVER_TIMESTAMP
+            }
+        })
+
+        return {
+            "status": "success",
+            "message": "Registro KYC completado. Los documentos han sido guardados y el perfil está activo."
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando KYC: {str(e)}")
