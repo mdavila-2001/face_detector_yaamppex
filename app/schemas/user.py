@@ -1,4 +1,5 @@
 from pydantic import BaseModel
+from typing import Optional
 
 class RegisterResponse(BaseModel):
     status: str
@@ -12,3 +13,5 @@ class VerifyResponse(BaseModel):
     verified: bool
     similarity_score: float
     liveness_score: float
+    action: Optional[str] = None
+    user_id: Optional[str] = None

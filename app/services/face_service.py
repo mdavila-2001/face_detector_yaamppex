@@ -167,8 +167,8 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
             
             return {
                 "status": "success",
-                "action": "created_pending_kyc", # Le avisamos a Flutter que falta info
-                "user_id": new_user_id, # Le pasamos el ID para que Flutter sepa a quién actualizar
+                "action": "created_pending_kyc",
+                "user_id": new_user_id,
                 "message": "Perfil base creado. Por favor complete sus datos y documentos.",
                 "verified": True,
                 "similarity_score": 1.0,
@@ -201,12 +201,27 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
             is_verified = similarity >= SIMILARITY_THRESHOLD
             
             if is_verified:
+                # Verificamos si completó su registro
+                estado = user_data.get('estadoTrabajador', 'incompleto')
+                if estado == 'incompleto':
+                    return {
+                        "status": "success",
+                        "action": "created_pending_kyc", # Lo mandamos a KYC
+                        "user_id": user_id,
+                        "message": "Bienvenido de vuelta. Por favor, finaliza tu registro completando tus datos personales.",
+                        "verified": True,
+                        "similarity_score": round(similarity, 4),
+                        "liveness_score": round(analisis["liveness_score"], 4)
+                    }
+
+                # Si ya está activo:
                 workers_ref.document(user_id).set({
                     'last_verified': firestore.SERVER_TIMESTAMP,
                     'status': 'active'
                 }, merge=True)
                 mensaje = "Verificación exitosa. El rostro coincide con el documento."
             else:
+                # 🛑 ¡Suplantador de identidad atrapado de flagrancia matemática!
                 mensaje = "Acceso Denegado. El rostro no coincide con el dueño de este documento."
                 
             return {
@@ -231,21 +246,19 @@ async def process_kyc_update(
     apellidos: str, 
     ci_front: bytes, 
     ci_back: bytes, 
-    passport_front: bytes, 
-    passport_back: bytes
+    passport_front: bytes = None,
+    passport_back: bytes = None
 ) -> dict:
     try:
         workers_ref = db.collection('trabajadores')
         worker_doc = workers_ref.document(user_id)
         
-        # 1. Verificamos que el "borrador" exista realmente
         doc_snapshot = worker_doc.get()
         if not doc_snapshot.exists:
             raise HTTPException(status_code=404, detail="Usuario no encontrado en el sistema.")
 
         bucket = storage.bucket()
 
-        # 2. Función auxiliar interna para no repetir código al subir fotos
         def upload_document_image(image_bytes: bytes, doc_type: str) -> str:
             nombre_archivo = f"documentos_kyc/{user_id}/{doc_type}_{uuid.uuid4().hex[:8]}.jpg"
             blob = bucket.blob(nombre_archivo)
@@ -253,26 +266,33 @@ async def process_kyc_update(
             blob.make_public()
             return blob.public_url
 
-        # 3. Subimos las 4 fotos a Firebase Storage de forma concurrente
-        # Se guardarán ordenadas en una carpeta con el ID del usuario
+        async def upload_if_exists(image_bytes: bytes, doc_type: str):
+            if not image_bytes:
+                return None
+            return await asyncio.to_thread(upload_document_image, image_bytes, doc_type)
+
         url_ci_front, url_ci_back, url_passport_front, url_passport_back = await asyncio.gather(
-            asyncio.to_thread(upload_document_image, ci_front, "ci_anverso"),
-            asyncio.to_thread(upload_document_image, ci_back, "ci_reverso"),
-            asyncio.to_thread(upload_document_image, passport_front, "pasaporte_anverso"),
-            asyncio.to_thread(upload_document_image, passport_back, "pasaporte_reverso")
+            upload_if_exists(ci_front, "ci_anverso"),
+            upload_if_exists(ci_back, "ci_reverso"),
+            upload_if_exists(passport_front, "pasaporte_anverso"),
+            upload_if_exists(passport_back, "pasaporte_reverso")
         )
 
-        # 4. Actualizamos la base de datos (Quitamos el candado)
+        documentos = {
+            'ci_anverso': url_ci_front,
+            'ci_reverso': url_ci_back,
+            'uploaded_at': firestore.SERVER_TIMESTAMP
+        }
+        if url_passport_front:
+            documentos['pasaporte_anverso'] = url_passport_front
+        if url_passport_back:
+            documentos['pasaporte_reverso'] = url_passport_back
+
+        # 5. Actualizamos la base de datos (Quitamos el candado)
         worker_doc.update({
             'estadoTrabajador': 'activo', # 🟢 ¡Usuario liberado para trabajar!
             'perfil.name': f"{nombres} {apellidos}", # Usamos dot notation para actualizar dentro del mapa 'perfil'
-            'documentos': {
-                'ci_anverso': url_ci_front,
-                'ci_reverso': url_ci_back,
-                'pasaporte_anverso': url_passport_front,
-                'pasaporte_reverso': url_passport_back,
-                'uploaded_at': firestore.SERVER_TIMESTAMP
-            }
+            'documentos': documentos
         })
 
         return {

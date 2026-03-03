@@ -2,12 +2,13 @@ from typing import Annotated
 from fastapi import APIRouter, UploadFile, File, Form
 from app.schemas.user import VerifyResponse
 from app.services import face_service
+from typing import Optional
 
 router = APIRouter()
 
 @router.post("/auth", response_model=VerifyResponse)
 async def smart_auth_endpoint(
-    document_number: Annotated[str, Form(...)], # Aquí Flutter enviará el CI o Pasaporte
+    document_number: Annotated[str, Form(...)],
     live_photo: Annotated[UploadFile, File(...)]
 ):
     photo_bytes = await live_photo.read()
@@ -21,16 +22,14 @@ async def update_kyc_endpoint(
     apellidos: Annotated[str, Form(...)],
     ci_front: Annotated[UploadFile, File(...)],
     ci_back: Annotated[UploadFile, File(...)],
-    passport_front: Annotated[UploadFile, File(...)],
-    passport_back: Annotated[UploadFile, File(...)]
+    passport_front: Annotated[Optional[UploadFile], File()] = None,
+    passport_back: Annotated[Optional[UploadFile], File()] = None
 ):
-    # Leemos los bytes de todos los archivos que llegaron desde Flutter
     bytes_ci_front = await ci_front.read()
     bytes_ci_back = await ci_back.read()
-    bytes_passport_front = await passport_front.read()
-    bytes_passport_back = await passport_back.read()
+    bytes_passport_front = await passport_front.read() if passport_front else None
+    bytes_passport_back = await passport_back.read() if passport_back else None
 
-    # Mandamos todo al servicio
     result = await face_service.process_kyc_update(
         user_id=user_id,
         nombres=nombres,
