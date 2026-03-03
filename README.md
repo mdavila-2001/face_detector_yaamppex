@@ -110,19 +110,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 5. Puesta en Producción (Recomendado o Estándar de Industria)
 No se recomienda dejar corriendo el comando anterior en modo *Attach* para un servidor vivo, ya que si ocurre un reinicio del VPS, la API morirá.
 
-Crear el archivo de servicio `/etc/systemd/system/biometria.service`:
+Crear el archivo de servicio `/etc/systemd/system/api-biometria.service`:
 ```ini
 [Unit]
-Description=Yaamppex Face Verification API
+Description=Backend de Biometria FastAPI - YAAMPPEX
 After=network.target
 
 [Service]
-User=root
-WorkingDirectory=/Ruta/Absoluta/Al/Proyecto
-ExecStart=/Ruta/Absoluta/Al/Proyecto/.env/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+User=server
+Group=www-data
+WorkingDirectory=/home/server/detector_facial
+
+ExecStart=/home/server/detector_facial/.env/bin/uvicorn app.main:app --host 0.0>
+
 Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 ```
-Luego habilitarlo con: `sudo systemctl enable biometria && sudo systemctl start biometria`.
+Luego habilitarlo con: `sudo systemctl enable api-biometria && sudo systemctl start api-biometria`.
