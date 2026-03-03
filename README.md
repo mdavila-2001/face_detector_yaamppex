@@ -73,10 +73,56 @@ Cualquier esfuerzo de "Mantenimiento" o "Actualización" futura debe respetar la
 | **`scipy`** | `1.12.0` | Complemento matemático optimizado para distancias. |
 | **`python-multipart`**| `0.0.9` | Analizador para poder recibir archivos binarios por HTTP `Form-Data`. |
 
-### Cómo Instalar en un Entorno Nuevo
-Si tus clientes migran a otro servidor, los pasos son simples:
-1. Instalar Python 3.12 o superior.
-2. Crear un entorno virtual (`python -m venv .env` y `source .env/bin/activate`).
-3. Instalar las dependencias exactas: `pip install -r requirements.txt`.
-4. Descargar los modelos en la carpeta `models/`.
-5. Ejecutar la app: `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+## 🚀 Instrucciones de Instalación y Despliegue (Producción)
+
+Para garantizar un entorno estable y listo para producción en el servidor del cliente (ej. Ubuntu/Linux VPS), siga rigurosamente estos pasos:
+
+### 1. Pre-requisitos del Servidor
+- **Python 3.10 o superior** instalado en el sistema.
+- **Tarjetas Gráficas (Opcional pero Recomendado):** Si el servidor cuenta con GPU (NVIDIA), asegúrese de tener instalados los drivers CUDA y cuDNN.
+- **Credenciales de Firebase:** Debe obtener el archivo `firebase_credentials.json` desde la consola de Google Cloud (IAM & Admin -> Service Accounts -> Keys) y colocarlo en un lugar seguro al que el código pueda apuntar.
+
+### 2. Configuración del Entorno Virtual
+Es obligatorio aislar las dependencias del sistema global para evitar colisiones:
+```bash
+# Crear entorno virtual
+python3 -m venv .env
+
+# Activar el entorno
+source .env/bin/activate
+
+# Instalar los paquetes matemáticos y lógicos exactos
+pip install -r requirements.txt
+```
+
+> **Nota para Servidores con GPU:** Si utiliza aceleración por hardware (`CUDAExecutionProvider`), asegúrese de instalar la variante compatible: `pip install onnxruntime-gpu`.
+
+### 3. Setup de los Modelos de Inteligencia Artificial
+1. Ubique los modelos `arcfaceresnet100-8.onnx` y `modelrgb.onnx` exactamente dentro de la carpeta `/models/` del proyecto.
+2. Tras la primera ejecución, la librería `insightface` descargará modelos base bajo la ruta `~/.insightface/models/buffalo_l/`. Asegúrese de que el usuario del servidor tenga permisos de escritura en su carpeta Home.
+
+### 4. Despliegue Local (Pruebas)
+Para verificar que todo carga correctamente antes de exponerlo, inicie el servidor de desarrollo puro:
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### 5. Puesta en Producción (Recomendado o Estándar de Industria)
+No se recomienda dejar corriendo el comando anterior en modo *Attach* para un servidor vivo, ya que si ocurre un reinicio del VPS, la API morirá.
+
+Crear el archivo de servicio `/etc/systemd/system/biometria.service`:
+```ini
+[Unit]
+Description=Yaamppex Face Verification API
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/Ruta/Absoluta/Al/Proyecto
+ExecStart=/Ruta/Absoluta/Al/Proyecto/.env/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+Luego habilitarlo con: `sudo systemctl enable biometria && sudo systemctl start biometria`.
