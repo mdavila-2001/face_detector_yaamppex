@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import asyncio
+import time
 import onnxruntime as ort
 from fastapi import HTTPException
 from insightface.app import FaceAnalysis
@@ -10,7 +11,26 @@ from google.cloud import firestore
 import uuid
 from firebase_admin import storage
 
+_embedding_cache = {}
+_CACHE_TTL = 300
+
+def _cache_get(document_number: str):
+    entry = _embedding_cache.get(document_number)
+    if entry and (time.time() - entry["ts"]) < _CACHE_TTL:
+        return entry
+    if entry:
+        del _embedding_cache[document_number]
+    return None
+
+def _cache_set(document_number: str, user_id: str, user_data: dict):
+    _embedding_cache[document_number] = {
+        "user_id": user_id,
+        "data": user_data,
+        "ts": time.time()
+    }
+
 face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CPUExecutionProvider'])
+#face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CUDAExecutionProvider'])
 face_app.prepare(ctx_id=0, det_size=(640, 640))
 
 ruta_liveness = "models/modelrgb.onnx"
@@ -124,17 +144,25 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
         workers_ref = db.collection('trabajadores')
         user_doc = None
         user_id = None
-        
-        # 2. Búsqueda en cascada: Primero por CI
-        query_ci = workers_ref.where('ci', '==', document_number).get()
-        
-        if len(query_ci) > 0:
-            user_doc = query_ci[0]
-            user_id = user_doc.id
+        user_data = None
+
+        # 2. CACHÉ: Si el usuario ya pasó hace menos de 5 min, nos ahorramos Firestore por completo (~0ms)
+        cached = _cache_get(document_number)
+        if cached:
+            user_id = cached["user_id"]
+            user_data = cached["data"]
+            user_doc = True  # Señal de que existe
         else:
-            # 3. Si no existe por CI, buscamos por Pasaporte
-            query_pasaporte = workers_ref.where('pasaporte', '==', document_number).get()
-            if len(query_pasaporte) > 0:
+            # 3. CONSULTAS PARALELAS: CI y Pasaporte al mismo tiempo (~200ms en vez de ~400ms)
+            query_ci, query_pasaporte = await asyncio.gather(
+                asyncio.to_thread(lambda: list(workers_ref.where('ci', '==', document_number).get())),
+                asyncio.to_thread(lambda: list(workers_ref.where('pasaporte', '==', document_number).get()))
+            )
+
+            if len(query_ci) > 0:
+                user_doc = query_ci[0]
+                user_id = user_doc.id
+            elif len(query_pasaporte) > 0:
                 user_doc = query_pasaporte[0]
                 user_id = user_doc.id
 
@@ -177,7 +205,8 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
             
         else:
             # ESCENARIO B: EL USUARIO SÍ EXISTE -> VERIFICAMOS EL ROSTRO
-            user_data = user_doc.to_dict()
+            if user_data is None:
+                user_data = user_doc.to_dict()
             saved_embedding = user_data.get('face_embedding')
             
             # Sub-escenario B1: Existe en la BD pero no tiene biometría previa (Sincronización)
@@ -206,7 +235,7 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
                 if estado == 'incompleto':
                     return {
                         "status": "success",
-                        "action": "created_pending_kyc", # Lo mandamos a KYC
+                        "action": "created_pending_kyc",
                         "user_id": user_id,
                         "message": "Bienvenido de vuelta. Por favor, finaliza tu registro completando tus datos personales.",
                         "verified": True,
@@ -215,13 +244,13 @@ async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
                     }
 
                 # Si ya está activo:
-                workers_ref.document(user_id).set({
+                asyncio.get_event_loop().run_in_executor(None, lambda: workers_ref.document(user_id).set({
                     'last_verified': firestore.SERVER_TIMESTAMP,
                     'status': 'active'
-                }, merge=True)
+                }, merge=True))
+                _cache_set(document_number, user_id, user_data)
                 mensaje = "Verificación exitosa. El rostro coincide con el documento."
             else:
-                # 🛑 ¡Suplantador de identidad atrapado de flagrancia matemática!
                 mensaje = "Acceso Denegado. El rostro no coincide con el dueño de este documento."
                 
             return {
