@@ -24,47 +24,35 @@ Todo el flujo de análisis está empaquetado y optimizado en CPU para ejecutarse
 
 ## Endpoints de la API
 
-### 1. Registro de Conductor (`POST /api/v1/register`)
-Se utiliza la primera vez que un usuario humano se da de alta en el sistema. Evalúa que sea real, procesa su rostro y guarda su Vector Identificador (Embedding de 512 dims) en Firebase (Colección `drivers`).
+### 1. Smart Auth / Login Biométrico (`POST /auth`)
+Integra tanto el Registro Inicial (Lazy Registration) como la Validación Recurrente en un solo endpoint inteligente.
+Busca al trabajador en cascada por su CI o Pasaporte. Si no existe, lo crea asignándole un estado seguro `'incompleto'` hasta que envíe sus documentos. Si existe y la biometría coincide, valida su ingreso a operaciones regulares.
 
 **Input Form Data:**
-- `user_id`: (String) Identificador único del usuario (UUID, Cédula, etc).
-- `live_photo`: (File) El archivo binario de la foto recién tomada.
+- `document_number`: (String) Número de Cédula o Pasaporte.
+- `live_photo`: (File) Fotografía biométrica en vivo recién tomada para evaluar su liveness e identidad.
 
-**Respuesta Exitosa (200 OK):**
-```json
-{
-  "status": "success",
-  "message": "Conductor user_id registrado exitosamente.",
-  "embedding_size": 512,
-  "liveness_score": 0.9845
-}
-```
+**Comportamientos y Respuestas (200 OK):**
+La app en Flutter decide la redirección de pantalla basándose en la variable `action` que devuelve el servidor:
+- `"action": "created_pending_kyc"`: Perfil borrador creado. Debe enviarse al conductor al formulario KYC Onboarding de inmediato.
+- `"action": "verified"`: Verificación matemática exitosa. El usuario accede a la pestaña principal.
+- `"action": "biometrics_updated"`: Primera foto en vivo sincronizada a la perfección con el perfil administrativo existente.
 
-### 2. Verificación de Identidad (`POST /api/v1/verify`)
-Compara la fotografía actual con el vector que previamente se tenía almacenado en Firebase para ese mismo `user_id`.
+### 2. Actualización de Documentos KYC (`POST /update_kyc`)
+Último paso determinante donde el trabajador sube su set de documentos personales para formalizar su inscripción, desbloqueando su estado borrador ('incompleto') al estatus `'activo'`. Utiliza procesadores subyacentes múltiples (`asyncio.gather`) permitiendo que de dos a cuatro fotos pesadas se envíen a Google Cloud simultáneamente.
 
 **Input Form Data:**
-- `user_id`: (String) Identificador único del usuario que reclama acceso.
-- `live_photo`: (File) La nueva fotografía tomada en el momento del acceso.
-
-**Respuesta Exitosa (200 OK):**
-```json
-{
-  "status": "success",
-  "message": "Acceso permitido por 24 horas.",
-  "verified": true,
-  "similarity_score": 0.9634,
-  "liveness_score": 0.9912
-}
-```
+- `user_id`, `nombres`, `apellidos`: Datos base en strings.
+- `ci_front`, `ci_back`: (Archivos Obligatorios) Rostro y contracara del Carnet.
+- `passport_front`, `passport_back`: (Archivos Opcionales) Rostro y contracara legal del Pasaporte.
 
 ---
 
 ## Puntos de Integración con Firebase
-El microservicio interactúa continuamente con `google-cloud-firestore`:
-* **`drivers/{user_id}`**: Guarda el estado del usuario, la fecha de primer registro, la última verificación exitosa, y el arreglo numérico `face_embedding`.
-* **`fraud_attempts/{auto_id}`**: (Auditoría de Seguridad) Si un intento no pasa la prueba de Liveness, se registra aquí de forma silenciosa el `user_id`, la acción iterada, el porcentaje capturado y el `timestamp` para posteriores expulsiones.
+El microservicio interactúa ininterrumpidamente con las infraestructuras de Base de datos y Almacenamiento:
+* **Colección `trabajadores/{user_id}`**: Corazón del sistema del conductor. Almacena en estado unificado (`perfil`, `documentos`) sus métricas en línea y su huella irreplicable global (`face_embedding`).
+* **Colección `fraud_attempts/{auto_id}`**: Auditorías Anti-Spoofing. Si un intento choca estrepitosamente en el sistema (ej. fotografía tomada a la pantalla de un monitor), aparta las credenciales asaltantes resguardando el ecosistema.
+* **Storage `fotos_perfil/` y `documentos_kyc/`**: Gestores fotográficos organizados vía UUIDs, listos para arrojar firmas URL blindadas a perfiles sin temor a colisión de nomenclatura.
 
 ---
 
