@@ -37,7 +37,7 @@ except Exception as e:
 LIVENESS_THRESHOLD = 0.85
 SIMILARITY_THRESHOLD = 0.48
 
-def _analizar_rostro_completo(photo_bytes: bytes):
+def _analizar_rostro_completo(photo_bytes: bytes, check_liveness: bool = True):
     nparr = np.frombuffer(photo_bytes, np.uint8)
     img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
@@ -65,23 +65,27 @@ def _analizar_rostro_completo(photo_bytes: bytes):
     rostro_recortado = img_bgr[ny1:ny2, nx1:nx2]
     if rostro_recortado.size == 0: raise ValueError("Error al recortar el rostro detectado.")
 
-    img_rgb_liveness = cv2.cvtColor(rostro_recortado, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb_liveness, (112, 112))
-    img_normalized = img_resized.astype(np.float32) / 255.0
-    img_normalized = np.transpose(img_normalized, (2, 0, 1))
-    img_normalized = np.expand_dims(img_normalized, axis=0)
+    score_real = 0.0
+    is_real = True
 
-    resultado_liveness = liveness_session.run(None, {liveness_input_name: img_normalized})
-    score_real = float(resultado_liveness[0][0][1])
-    
-    is_real = score_real >= LIVENESS_THRESHOLD
+    if check_liveness:
+        img_rgb_liveness = cv2.cvtColor(rostro_recortado, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb_liveness, (112, 112))
+        img_normalized = img_resized.astype(np.float32) / 255.0
+        img_normalized = np.transpose(img_normalized, (2, 0, 1))
+        img_normalized = np.expand_dims(img_normalized, axis=0)
 
-    if not is_real:
-        return {
-            "liveness_score": score_real,
-            "is_real": False,
-            "embedding": None
-        }
+        resultado_liveness = liveness_session.run(None, {liveness_input_name: img_normalized})
+        score_real = float(resultado_liveness[0][0][1])
+        
+        is_real = score_real >= LIVENESS_THRESHOLD
+
+        if not is_real:
+            return {
+                "liveness_score": score_real,
+                "is_real": False,
+                "embedding": None
+            }
 
     if face.kps is None:
         raise ValueError("No se encontraron puntos de referencia (landmarks) en el rostro.")
@@ -317,7 +321,7 @@ async def process_face_registration(user_id: str, photo_bytes: bytes) -> dict:
                 raise HTTPException(status_code=500, detail="Error descargando el CI para verificación biométrica.")
 
             try:
-                analisis_ci = await asyncio.to_thread(_analizar_rostro_completo, ci_bytes)
+                analisis_ci = await asyncio.to_thread(_analizar_rostro_completo, ci_bytes, False)
                 similitud = _calcular_similitud(analisis["embedding"], analisis_ci["embedding"])
                 
                 if similitud < UMBRAL_SIMILITUD:
@@ -350,7 +354,7 @@ async def process_face_registration(user_id: str, photo_bytes: bytes) -> dict:
                 raise HTTPException(status_code=500, detail="Error descargando Licencia para verificación biométrica.")
 
             try:
-                analisis_lic = await asyncio.to_thread(_analizar_rostro_completo, lic_bytes)
+                analisis_lic = await asyncio.to_thread(_analizar_rostro_completo, lic_bytes, False)
                 similitud_lic = _calcular_similitud(analisis["embedding"], analisis_lic["embedding"])
                 
                 if similitud_lic < UMBRAL_SIMILITUD:
