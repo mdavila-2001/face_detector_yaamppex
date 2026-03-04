@@ -14,21 +14,6 @@ from firebase_admin import storage
 _embedding_cache = {}
 _CACHE_TTL = 300
 
-def _cache_get(document_number: str):
-    entry = _embedding_cache.get(document_number)
-    if entry and (time.time() - entry["ts"]) < _CACHE_TTL:
-        return entry
-    if entry:
-        del _embedding_cache[document_number]
-    return None
-
-def _cache_set(document_number: str, user_id: str, user_data: dict):
-    _embedding_cache[document_number] = {
-        "user_id": user_id,
-        "data": user_data,
-        "ts": time.time()
-    }
-
 face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CPUExecutionProvider'])
 #face_app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'landmark_2d_106'], providers=['CUDAExecutionProvider'])
 face_app.prepare(ctx_id=0, det_size=(640, 640))
@@ -41,7 +26,6 @@ try:
 except Exception as e:
     print(f"⚠️ Error cargando modelo Liveness: {e}")
 
-# C. Modelo Reconocimiento Facial (ArcFace ResNet100 MIT)
 ruta_arcface = "models/arcfaceresnet100-8.onnx"
 try:
     arcface_session = ort.InferenceSession(ruta_arcface, providers=['CPUExecutionProvider'])
@@ -50,8 +34,8 @@ try:
 except Exception as e:
     print(f"⚠️ Error cargando modelo ArcFace: {e}")
 
-SIMILARITY_THRESHOLD = 0.48
 LIVENESS_THRESHOLD = 0.85
+SIMILARITY_THRESHOLD = 0.48
 
 def _analizar_rostro_completo(photo_bytes: bytes):
     nparr = np.frombuffer(photo_bytes, np.uint8)
@@ -126,157 +110,36 @@ def _calcular_similitud(embedding1: list, embedding2: list) -> float:
     dot_product = np.dot(vec1, vec2)
     return float(dot_product / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
 
-async def process_smart_auth(document_number: str, photo_bytes: bytes) -> dict:
+import urllib.request
+async def register_worker_data(nombres: str, apellidos: str) -> dict:
     try:
-        # 1. Analizar la foto en vivo (Liveness + Extracción del Vector)
-        analisis = await asyncio.to_thread(_analizar_rostro_completo, photo_bytes)
-        
-        # Si es una foto a una pantalla/papel, bloqueamos al instante
-        if not analisis["is_real"]:
-            db.collection('fraud_attempts').add({
-                'document_number': document_number, 
-                'action': 'smart_auth', 
-                'liveness_score': analisis["liveness_score"], 
-                'timestamp': firestore.SERVER_TIMESTAMP
-            })
-            raise HTTPException(status_code=403, detail="Alerta de Seguridad: Prueba de vida fallida (Posible Spoofing).")
-
         workers_ref = db.collection('trabajadores')
-        user_doc = None
-        user_id = None
-        user_data = None
-
-        # 2. CACHÉ: Si el usuario ya pasó hace menos de 5 min, nos ahorramos Firestore por completo (~0ms)
-        cached = _cache_get(document_number)
-        if cached:
-            user_id = cached["user_id"]
-            user_data = cached["data"]
-            user_doc = True  # Señal de que existe
-        else:
-            # 3. CONSULTAS PARALELAS: CI y Pasaporte al mismo tiempo (~200ms en vez de ~400ms)
-            query_ci, query_pasaporte = await asyncio.gather(
-                asyncio.to_thread(lambda: list(workers_ref.where('ci', '==', document_number).get())),
-                asyncio.to_thread(lambda: list(workers_ref.where('pasaporte', '==', document_number).get()))
-            )
-
-            if len(query_ci) > 0:
-                user_doc = query_ci[0]
-                user_id = user_doc.id
-            elif len(query_pasaporte) > 0:
-                user_doc = query_pasaporte[0]
-                user_id = user_doc.id
-
-        # 4. LÓGICA DE DECISIÓN (Crear vs Verificar)
-        if not user_doc:
-            # ESCENARIO A: EL USUARIO NO EXISTE -> LO CREAMOS EN BORRADOR (Lazy Registration)
-            
-            new_user_ref = workers_ref.document() # Generamos el documento vacío
-            new_user_id = new_user_ref.id # ¡Capturamos el ID generado!
-            
-            # --- Subir foto a Firebase Storage ---
-            bucket = storage.bucket()
-            nombre_archivo = f"fotos_perfil/{document_number}_{uuid.uuid4().hex[:8]}.jpg"
-            blob = bucket.blob(nombre_archivo)
-            blob.upload_from_string(photo_bytes, content_type='image/jpeg')
-            blob.make_public() 
-            photo_url = blob.public_url
-            # --------------------------------------------
-
-            new_user_ref.set({
-                'ci': document_number,
-                'estadoTrabajador': 'incompleto', # 🔒 CANDADO: No puede operar aún
-                'face_embedding': analisis["embedding"],
-                'created_at': firestore.SERVER_TIMESTAMP,
-                'perfil': {
-                    'photoUrl': photo_url, 
-                    'createdAt': firestore.SERVER_TIMESTAMP
-                }
-            }, merge=True)
-            
-            return {
-                "status": "success",
-                "action": "created_pending_kyc",
-                "user_id": new_user_id,
-                "message": "Perfil base creado. Por favor complete sus datos y documentos.",
-                "verified": True,
-                "similarity_score": 1.0,
-                "liveness_score": round(analisis["liveness_score"], 4)
+        new_user_ref = workers_ref.document()
+        new_user_id = new_user_ref.id
+        
+        new_user_ref.set({
+            'estadoTrabajador': 'incompleto',
+            'created_at': firestore.SERVER_TIMESTAMP,
+            'perfil': {
+                'name': f"{nombres} {apellidos}",
+                'createdAt': firestore.SERVER_TIMESTAMP
             }
-            
-        else:
-            # ESCENARIO B: EL USUARIO SÍ EXISTE -> VERIFICAMOS EL ROSTRO
-            if user_data is None:
-                user_data = user_doc.to_dict()
-            saved_embedding = user_data.get('face_embedding')
-            
-            # Sub-escenario B1: Existe en la BD pero no tiene biometría previa (Sincronización)
-            if not saved_embedding:
-                workers_ref.document(user_id).set({
-                    'face_embedding': analisis["embedding"],
-                    'updated_at': firestore.SERVER_TIMESTAMP
-                }, merge=True)
-                
-                return {
-                    "status": "success",
-                    "action": "biometrics_updated",
-                    "message": "Usuario encontrado, pero no tenía rostro registrado. Biometría guardada exitosamente.",
-                    "verified": True,
-                    "similarity_score": 1.0,
-                    "liveness_score": round(analisis["liveness_score"], 4)
-                }
-                
-            # Sub-escenario B2: Ya tiene biometría -> Hacemos el Match Matemático
-            similarity = _calcular_similitud(saved_embedding, analisis["embedding"])
-            is_verified = similarity >= SIMILARITY_THRESHOLD
-            
-            if is_verified:
-                # Verificamos si completó su registro
-                estado = user_data.get('estadoTrabajador', 'incompleto')
-                if estado == 'incompleto':
-                    return {
-                        "status": "success",
-                        "action": "created_pending_kyc",
-                        "user_id": user_id,
-                        "message": "Bienvenido de vuelta. Por favor, finaliza tu registro completando tus datos personales.",
-                        "verified": True,
-                        "similarity_score": round(similarity, 4),
-                        "liveness_score": round(analisis["liveness_score"], 4)
-                    }
-
-                # Si ya está activo:
-                asyncio.get_event_loop().run_in_executor(None, lambda: workers_ref.document(user_id).set({
-                    'last_verified': firestore.SERVER_TIMESTAMP,
-                    'status': 'active'
-                }, merge=True))
-                _cache_set(document_number, user_id, user_data)
-                mensaje = "Verificación exitosa. El rostro coincide con el documento."
-            else:
-                mensaje = "Acceso Denegado. El rostro no coincide con el dueño de este documento."
-                
-            return {
-                "status": "success" if is_verified else "failed",
-                "action": "verified",
-                "message": mensaje,
-                "verified": is_verified,
-                "similarity_score": round(similarity, 4),
-                "liveness_score": round(analisis["liveness_score"], 4)
-            }
-
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except HTTPException as he:
-        raise he
+        }, merge=True)
+        
+        return {
+            "status": "success",
+            "user_id": new_user_id,
+            "message": "Datos registrados. Por favor suba sus documentos."
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error registrando datos: {str(e)}")
 
 async def process_kyc_update(
     user_id: str, 
-    nombres: str, 
-    apellidos: str, 
     ci_front: bytes, 
     ci_back: bytes, 
-    passport_front: bytes = None,
-    passport_back: bytes = None
+    license_front: bytes = None,
+    license_back: bytes = None
 ) -> dict:
     try:
         workers_ref = db.collection('trabajadores')
@@ -289,7 +152,8 @@ async def process_kyc_update(
         bucket = storage.bucket()
 
         def upload_document_image(image_bytes: bytes, doc_type: str) -> str:
-            nombre_archivo = f"documentos_kyc/{user_id}/{doc_type}_{uuid.uuid4().hex[:8]}.jpg"
+            carpeta_principal = "ci" if "ci" in doc_type else "licencia"
+            nombre_archivo = f"trabajadores/{user_id}/documentosPersonales/{carpeta_principal}/{doc_type}_{uuid.uuid4().hex[:8]}.jpg"
             blob = bucket.blob(nombre_archivo)
             blob.upload_from_string(image_bytes, content_type='image/jpeg')
             blob.make_public()
@@ -300,34 +164,239 @@ async def process_kyc_update(
                 return None
             return await asyncio.to_thread(upload_document_image, image_bytes, doc_type)
 
-        url_ci_front, url_ci_back, url_passport_front, url_passport_back = await asyncio.gather(
+        url_ci_front, url_ci_back, url_license_front, url_license_back = await asyncio.gather(
             upload_if_exists(ci_front, "ci_anverso"),
             upload_if_exists(ci_back, "ci_reverso"),
-            upload_if_exists(passport_front, "pasaporte_anverso"),
-            upload_if_exists(passport_back, "pasaporte_reverso")
+            upload_if_exists(license_front, "licencia_anverso"),
+            upload_if_exists(license_back, "licencia_reverso")
         )
 
         documentos = {
-            'ci_anverso': url_ci_front,
-            'ci_reverso': url_ci_back,
-            'uploaded_at': firestore.SERVER_TIMESTAMP
+            'ci': {
+                'frontalUrl': url_ci_front,
+                'reversoUrl': url_ci_back,
+                'estado': 'en_revision',
+                'mensajeRevision': '',
+                'uploadedAt': firestore.SERVER_TIMESTAMP
+            }
         }
-        if url_passport_front:
-            documentos['pasaporte_anverso'] = url_passport_front
-        if url_passport_back:
-            documentos['pasaporte_reverso'] = url_passport_back
 
-        # 5. Actualizamos la base de datos (Quitamos el candado)
+        if url_license_front or url_license_back:
+            documentos['licencia'] = {
+                'frontalUrl': url_license_front,
+                'reversoUrl': url_license_back,
+                'estado': 'en_revision',
+                'mensajeRevision': '',
+                'uploadedAt': firestore.SERVER_TIMESTAMP
+            }
+
         worker_doc.update({
-            'estadoTrabajador': 'activo', # 🟢 ¡Usuario liberado para trabajar!
-            'perfil.name': f"{nombres} {apellidos}", # Usamos dot notation para actualizar dentro del mapa 'perfil'
-            'documentos': documentos
+            'documentosPersonales': documentos
         })
 
         return {
             "status": "success",
-            "message": "Registro KYC completado. Los documentos han sido guardados y el perfil está activo."
+            "message": "Documentos guardados exitosamente. Proceda al escaneo facial.",
+            "user_id": user_id
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando KYC: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error procesando documentos: {str(e)}")
+
+async def process_initial_face_login(photo_bytes: bytes) -> dict:
+    try:
+        # Analizamos la selfie
+        analisis = await asyncio.to_thread(_analizar_rostro_completo, photo_bytes)
+        
+        if not analisis["is_real"]:
+            db.collection('fraud_attempts').add({
+                'action': 'initial_face_login', 
+                'liveness_score': analisis["liveness_score"], 
+                'timestamp': firestore.SERVER_TIMESTAMP
+            })
+            raise HTTPException(status_code=403, detail="Alerta de Seguridad: Prueba de vida fallida (Posible Spoofing).")
+
+        live_embedding = analisis["embedding"]
+
+        # Buscar todos los trabajadores que están activos (y que tienen hash)
+        workers_ref = db.collection('trabajadores')
+        query = workers_ref.where(filter=firestore.FieldFilter("estadoTrabajador", "==", "activo"))
+        active_workers = query.stream()
+
+        UMBRAL_SIMILITUD = 0.50 
+
+        for worker in active_workers:
+            doc_data = worker.to_dict()
+            saved_embedding = doc_data.get('face_embedding')
+            
+            if saved_embedding:
+                similitud = _calcular_similitud(live_embedding, saved_embedding)
+                if similitud >= UMBRAL_SIMILITUD:
+                    # Lo encontramos, actualizar ultima validacion
+                    worker.reference.update({
+                        'ultimaValidacionRostroAt': firestore.SERVER_TIMESTAMP,
+                    })
+                    return {
+                        "status": "success",
+                        "user_id": worker.id,
+                        "action": "logged_in",
+                        "message": f"Bienvenido de vuelta, {doc_data.get('perfil', {}).get('name', 'Usuario')}.",
+                        "liveness_score": round(analisis["liveness_score"], 4)
+                    }
+
+        # Si recorre todos los trabajadores activos y ninguno hace match
+        return {
+            "status": "not_found",
+            "message": "Rostro no registrado en el sistema. Redirigiendo a registro."
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error interno en login: {str(e)}")
+
+async def process_face_registration(user_id: str, photo_bytes: bytes) -> dict:
+    try:
+        # Se requiere importar _analizar_rostro_completo en el entorno principal
+        analisis = await asyncio.to_thread(_analizar_rostro_completo, photo_bytes)
+        
+        if not analisis["is_real"]:
+            db.collection('fraud_attempts').add({
+                'user_id': user_id, 
+                'action': 'smart_auth_registration', 
+                'liveness_score': analisis["liveness_score"], 
+                'timestamp': firestore.SERVER_TIMESTAMP
+            })
+            raise HTTPException(status_code=403, detail="Alerta de Seguridad: Prueba de vida fallida (Posible Spoofing).")
+
+        workers_ref = db.collection('trabajadores')
+        worker_doc = workers_ref.document(user_id)
+        
+        doc_snapshot = worker_doc.get()
+        if not doc_snapshot.exists:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+            
+        doc_data = doc_snapshot.to_dict() or {}
+        
+        # 1. Si ya tiene face_embedding guardado (Validación de 24 horas o reingreso)
+        saved_embedding = doc_data.get('face_embedding')
+        UMBRAL_SIMILITUD = 0.50 
+
+        if saved_embedding:
+            similitud = _calcular_similitud(analisis["embedding"], saved_embedding)
+            if similitud < UMBRAL_SIMILITUD:
+                raise HTTPException(status_code=403, detail="Error: El rostro capturado no coincide con el titular de la cuenta.")
+            
+            worker_doc.update({
+                'ultimaValidacionRostroAt': firestore.SERVER_TIMESTAMP,
+                'updated_at': firestore.SERVER_TIMESTAMP
+            })
+            return {
+                "status": "success",
+                "action": "verified",
+                "message": "Verificación biométrica exitosa. Bienvenido de vuelta.",
+                "verified": True,
+                "liveness_score": round(analisis["liveness_score"], 4)
+            }
+
+        # 2. Si NO tiene face_embedding (Registro por primera vez)
+        documentos = doc_data.get('documentosPersonales', {})
+        ci_doc = documentos.get('ci', {})
+        ci_anverso_url = ci_doc.get('frontalUrl')
+        ci_estado = ci_doc.get('estado')
+
+        # Si hay CI y no está aprobado aún, verificamos
+        if ci_anverso_url and ci_estado != 'aprobado':
+            try:
+                req = urllib.request.Request(ci_anverso_url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req) as response:
+                    ci_bytes = response.read()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail="Error descargando el CI para verificación biométrica.")
+
+            try:
+                analisis_ci = await asyncio.to_thread(_analizar_rostro_completo, ci_bytes)
+                similitud = _calcular_similitud(analisis["embedding"], analisis_ci["embedding"])
+                
+                if similitud < UMBRAL_SIMILITUD:
+                    worker_doc.update({
+                        'documentosPersonales.ci.estado': 'rechazado',
+                        'documentosPersonales.ci.mensajeRevision': 'El rostro en la selfie no coincide con el del carnet.',
+                        'documentosPersonales.ci.revisadoAt': firestore.SERVER_TIMESTAMP
+                    })
+                    raise HTTPException(status_code=403, detail="El rostro capturado no coincide con el del documento de identidad.")
+
+                worker_doc.update({
+                    'documentosPersonales.ci.estado': 'aprobado',
+                    'documentosPersonales.ci.mensajeRevision': '',
+                    'documentosPersonales.ci.revisadoAt': firestore.SERVER_TIMESTAMP,
+                })
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=f"Error analizando rostro en CI: {str(ve)}")
+
+        # Lo mismo para Licencia si lo hay
+        lic_doc = documentos.get('licencia', {})
+        licencia_url = lic_doc.get('frontalUrl')
+        licencia_estado = lic_doc.get('estado')
+
+        if licencia_url and licencia_estado != 'aprobado':
+            try:
+                req = urllib.request.Request(licencia_url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req) as response:
+                    lic_bytes = response.read()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail="Error descargando Licencia para verificación biométrica.")
+
+            try:
+                analisis_lic = await asyncio.to_thread(_analizar_rostro_completo, lic_bytes)
+                similitud_lic = _calcular_similitud(analisis["embedding"], analisis_lic["embedding"])
+                
+                if similitud_lic < UMBRAL_SIMILITUD:
+                    worker_doc.update({
+                        'documentosPersonales.licencia.estado': 'rechazado',
+                        'documentosPersonales.licencia.mensajeRevision': 'El rostro en la selfie no coincide con el de la licencia.',
+                        'documentosPersonales.licencia.revisadoAt': firestore.SERVER_TIMESTAMP
+                    })
+                    raise HTTPException(status_code=403, detail="El rostro capturado no coincide con el de la licencia.")
+
+                worker_doc.update({
+                    'documentosPersonales.licencia.estado': 'aprobado',
+                    'documentosPersonales.licencia.mensajeRevision': '',
+                    'documentosPersonales.licencia.revisadoAt': firestore.SERVER_TIMESTAMP,
+                })
+            except ValueError as ve:
+                # Si falla detectar cara en licencia, podríamos solo omitirlo o lanzar error
+                print(f"Advertencia: No se encontró rostro en la licencia: {ve}")
+
+        # 3. Si todo sale bien (o ya estaban aprobados), guardamos la foto y el embedding inicial
+        bucket = storage.bucket()
+        nombre_archivo = f"fotos_perfil/{user_id}_{uuid.uuid4().hex[:8]}.jpg"
+        blob = bucket.blob(nombre_archivo)
+        blob.upload_from_string(photo_bytes, content_type='image/jpeg')
+        blob.make_public() 
+        photo_url = blob.public_url
+
+        worker_doc.update({
+            'face_embedding': analisis["embedding"],
+            'perfil.photoUrl': photo_url,
+            'estadoTrabajador': 'activo',
+            'ultimaValidacionRostroAt': firestore.SERVER_TIMESTAMP,
+            'updated_at': firestore.SERVER_TIMESTAMP
+        })
+        
+        return {
+            "status": "success",
+            "action": "registered_and_verified",
+            "message": "Registro y validación completados exitosamente. Bienvenido.",
+            "verified": True,
+            "liveness_score": round(analisis["liveness_score"], 4)
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
