@@ -115,7 +115,7 @@ def _calcular_similitud(embedding1: list, embedding2: list) -> float:
     return float(dot_product / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
 
 import urllib.request
-async def register_worker_data(nombres: str, apellidos: str) -> dict:
+def register_worker_data(nombres: str, apellidos: str) -> dict:
     try:
         workers_ref = db.collection('trabajadores')
         new_user_ref = workers_ref.document()
@@ -227,7 +227,8 @@ async def process_initial_face_login(photo_bytes: bytes) -> dict:
         query = workers_ref.where(filter=firestore.FieldFilter("estadoTrabajador", "==", "activo"))
         active_workers = query.stream()
 
-        UMBRAL_SIMILITUD = 0.50 
+        mejor_similitud = 0.0
+        mejor_worker = None
 
         for worker in active_workers:
             doc_data = worker.to_dict()
@@ -235,20 +236,24 @@ async def process_initial_face_login(photo_bytes: bytes) -> dict:
             
             if saved_embedding:
                 similitud = _calcular_similitud(live_embedding, saved_embedding)
-                if similitud >= UMBRAL_SIMILITUD:
-                    # Lo encontramos, actualizar ultima validacion
-                    worker.reference.update({
-                        'ultimaValidacionRostroAt': firestore.SERVER_TIMESTAMP,
-                    })
-                    return {
-                        "status": "success",
-                        "user_id": worker.id,
-                        "action": "logged_in",
-                        "message": f"Bienvenido de vuelta, {doc_data.get('perfil', {}).get('name', 'Usuario')}.",
-                        "liveness_score": round(analisis["liveness_score"], 4)
-                    }
+                if similitud > mejor_similitud:
+                    mejor_similitud = similitud
+                    mejor_worker = worker
 
-        # Si recorre todos los trabajadores activos y ninguno hace match
+        if mejor_worker and mejor_similitud >= SIMILARITY_THRESHOLD:
+            doc_data = mejor_worker.to_dict()
+            mejor_worker.reference.update({
+                'ultimaValidacionRostroAt': firestore.SERVER_TIMESTAMP,
+            })
+            return {
+                "status": "success",
+                "user_id": mejor_worker.id,
+                "action": "logged_in",
+                "message": f"Bienvenido de vuelta, {doc_data.get('perfil', {}).get('name', 'Usuario')}.",
+                "liveness_score": round(analisis["liveness_score"], 4)
+            }
+
+        # Si recorre todos los trabajadores activos y ninguno hace match o supera el umbral
         return {
             "status": "not_found",
             "message": "Rostro no registrado en el sistema. Redirigiendo a registro."
@@ -260,6 +265,41 @@ async def process_initial_face_login(photo_bytes: bytes) -> dict:
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error interno en login: {str(e)}")
+
+async def _verificar_rostro_documento(worker_doc, documentos, tipo_doc, nombre_legible, live_embedding, umbral):
+    doc = documentos.get(tipo_doc, {})
+    url = doc.get('frontalUrl')
+    estado = doc.get('estado')
+
+    if not url or estado == 'aprobado':
+        return
+
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            doc_bytes = response.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error descargando {nombre_legible} para verificación biométrica. {e}")
+
+    try:
+        analisis_doc = await asyncio.to_thread(_analizar_rostro_completo, doc_bytes)
+        similitud = _calcular_similitud(live_embedding, analisis_doc["embedding"])
+        
+        if similitud < umbral:
+            worker_doc.update({
+                f'documentosPersonales.{tipo_doc}.estado': 'rechazado',
+                f'documentosPersonales.{tipo_doc}.mensajeRevision': f'El rostro en la selfie no coincide con el de {nombre_legible}.',
+                f'documentosPersonales.{tipo_doc}.revisadoAt': firestore.SERVER_TIMESTAMP
+            })
+            raise HTTPException(status_code=403, detail=f"El rostro capturado no coincide con el de {nombre_legible}.")
+
+        worker_doc.update({
+            f'documentosPersonales.{tipo_doc}.estado': 'aprobado',
+            f'documentosPersonales.{tipo_doc}.mensajeRevision': '',
+            f'documentosPersonales.{tipo_doc}.revisadoAt': firestore.SERVER_TIMESTAMP,
+        })
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=f"Error analizando rostro en {nombre_legible}: {str(ve)}")
 
 async def process_face_registration(user_id: str, photo_bytes: bytes) -> dict:
     try:
@@ -307,72 +347,9 @@ async def process_face_registration(user_id: str, photo_bytes: bytes) -> dict:
 
         # 2. Si NO tiene face_embedding (Registro por primera vez)
         documentos = doc_data.get('documentosPersonales', {})
-        ci_doc = documentos.get('ci', {})
-        ci_anverso_url = ci_doc.get('frontalUrl')
-        ci_estado = ci_doc.get('estado')
-
-        # Si hay CI y no está aprobado aún, verificamos
-        if ci_anverso_url and ci_estado != 'aprobado':
-            try:
-                req = urllib.request.Request(ci_anverso_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req) as response:
-                    ci_bytes = response.read()
-            except Exception as e:
-                raise HTTPException(status_code=500, detail="Error descargando el CI para verificación biométrica.")
-
-            try:
-                analisis_ci = await asyncio.to_thread(_analizar_rostro_completo, ci_bytes, False)
-                similitud = _calcular_similitud(analisis["embedding"], analisis_ci["embedding"])
-                
-                if similitud < UMBRAL_SIMILITUD:
-                    worker_doc.update({
-                        'documentosPersonales.ci.estado': 'rechazado',
-                        'documentosPersonales.ci.mensajeRevision': 'El rostro en la selfie no coincide con el del carnet.',
-                        'documentosPersonales.ci.revisadoAt': firestore.SERVER_TIMESTAMP
-                    })
-                    raise HTTPException(status_code=403, detail="El rostro capturado no coincide con el del documento de identidad.")
-
-                worker_doc.update({
-                    'documentosPersonales.ci.estado': 'aprobado',
-                    'documentosPersonales.ci.mensajeRevision': '',
-                    'documentosPersonales.ci.revisadoAt': firestore.SERVER_TIMESTAMP,
-                })
-            except ValueError as ve:
-                raise HTTPException(status_code=400, detail=f"Error analizando rostro en CI: {str(ve)}")
-
-        # Lo mismo para Licencia si lo hay
-        lic_doc = documentos.get('licencia', {})
-        licencia_url = lic_doc.get('frontalUrl')
-        licencia_estado = lic_doc.get('estado')
-
-        if licencia_url and licencia_estado != 'aprobado':
-            try:
-                req = urllib.request.Request(licencia_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req) as response:
-                    lic_bytes = response.read()
-            except Exception as e:
-                raise HTTPException(status_code=500, detail="Error descargando Licencia para verificación biométrica.")
-
-            try:
-                analisis_lic = await asyncio.to_thread(_analizar_rostro_completo, lic_bytes, False)
-                similitud_lic = _calcular_similitud(analisis["embedding"], analisis_lic["embedding"])
-                
-                if similitud_lic < UMBRAL_SIMILITUD:
-                    worker_doc.update({
-                        'documentosPersonales.licencia.estado': 'rechazado',
-                        'documentosPersonales.licencia.mensajeRevision': 'El rostro en la selfie no coincide con el de la licencia.',
-                        'documentosPersonales.licencia.revisadoAt': firestore.SERVER_TIMESTAMP
-                    })
-                    raise HTTPException(status_code=403, detail="El rostro capturado no coincide con el de la licencia.")
-
-                worker_doc.update({
-                    'documentosPersonales.licencia.estado': 'aprobado',
-                    'documentosPersonales.licencia.mensajeRevision': '',
-                    'documentosPersonales.licencia.revisadoAt': firestore.SERVER_TIMESTAMP,
-                })
-            except ValueError as ve:
-                # Si falla detectar cara en licencia, podríamos solo omitirlo o lanzar error
-                print(f"Advertencia: No se encontró rostro en la licencia: {ve}")
+        
+        await _verificar_rostro_documento(worker_doc, documentos, 'ci', 'el carnet', analisis["embedding"], UMBRAL_SIMILITUD)
+        await _verificar_rostro_documento(worker_doc, documentos, 'licencia', 'la licencia', analisis["embedding"], UMBRAL_SIMILITUD)
 
         # 3. Si todo sale bien (o ya estaban aprobados), guardamos la foto y el embedding inicial
         bucket = storage.bucket()

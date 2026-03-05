@@ -5,11 +5,11 @@ from app.services import face_service
 router = APIRouter()
 
 @router.post("/register_data")
-async def register_data_endpoint(
+def register_data_endpoint(
     nombres: Annotated[str, Form(...)],
     apellidos: Annotated[str, Form(...)],
 ):
-    result = await face_service.register_worker_data(nombres=nombres, apellidos=apellidos)
+    result = face_service.register_worker_data(nombres=nombres, apellidos=apellidos)
     return result
 
 @router.post("/login_face")
