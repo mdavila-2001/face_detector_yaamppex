@@ -26,7 +26,7 @@ try:
 except Exception as e:
     print(f"⚠️ Error cargando modelo Liveness: {e}")
 
-ruta_arcface = "models/arcfaceresnet100-8.onnx"
+ruta_arcface = "models/arc.onnx"
 try:
     arcface_session = ort.InferenceSession(ruta_arcface, providers=['CPUExecutionProvider'])
     #arcface_session = ort.InferenceSession(ruta_arcface, providers=['CUDAExecutionProvider'])
@@ -35,7 +35,7 @@ except Exception as e:
     print(f"⚠️ Error cargando modelo ArcFace: {e}")
 
 LIVENESS_THRESHOLD = 0.85
-SIMILARITY_THRESHOLD = 0.48
+SIMILARITY_THRESHOLD = 0.96
 
 def _analizar_rostro_completo(photo_bytes: bytes, check_liveness: bool = True):
     nparr = np.frombuffer(photo_bytes, np.uint8)
@@ -93,8 +93,7 @@ def _analizar_rostro_completo(photo_bytes: bytes, check_liveness: bool = True):
     rostro_alineado = norm_crop(img_bgr, landmark=face.kps, image_size=112)
     
     arcface_rgb = cv2.cvtColor(rostro_alineado, cv2.COLOR_BGR2RGB)
-    arcface_tensor = np.transpose(arcface_rgb, (2, 0, 1))
-    arcface_tensor = np.expand_dims(arcface_tensor, axis=0)
+    arcface_tensor = np.expand_dims(arcface_rgb, axis=0)
     arcface_tensor = (arcface_tensor.astype(np.float32) - 127.5) / 127.5
     
     resultado_arcface = arcface_session.run(None, {arcface_input_name: arcface_tensor})
@@ -245,15 +244,18 @@ async def process_initial_face_login(photo_bytes: bytes) -> dict:
             mejor_worker.reference.update({
                 'ultimaValidacionRostroAt': firestore.SERVER_TIMESTAMP,
             })
+            print(f"Login exitoso: Usuario {mejor_worker.id} con similitud {mejor_similitud:.4f}")
             return {
                 "status": "success",
                 "user_id": mejor_worker.id,
                 "action": "logged_in",
                 "message": f"Bienvenido de vuelta, {doc_data.get('perfil', {}).get('name', 'Usuario')}.",
-                "liveness_score": round(analisis["liveness_score"], 4)
+                "liveness_score": round(analisis["liveness_score"], 4),
+                "similitud": round(mejor_similitud, 4)
             }
 
         # Si recorre todos los trabajadores activos y ninguno hace match o supera el umbral
+        print(f"Login fallido: Mejor similitud encontrada fue {mejor_similitud:.4f} (Umbral {SIMILARITY_THRESHOLD})")
         return {
             "status": "not_found",
             "message": "Rostro no registrado en el sistema. Redirigiendo a registro."
@@ -326,11 +328,10 @@ async def process_face_registration(user_id: str, photo_bytes: bytes) -> dict:
         
         # 1. Si ya tiene face_embedding guardado (Validación de 24 horas o reingreso)
         saved_embedding = doc_data.get('face_embedding')
-        UMBRAL_SIMILITUD = 0.50 
 
         if saved_embedding:
             similitud = _calcular_similitud(analisis["embedding"], saved_embedding)
-            if similitud < UMBRAL_SIMILITUD:
+            if similitud < SIMILARITY_THRESHOLD:
                 raise HTTPException(status_code=403, detail="Error: El rostro capturado no coincide con el titular de la cuenta.")
             
             worker_doc.update({
@@ -348,8 +349,8 @@ async def process_face_registration(user_id: str, photo_bytes: bytes) -> dict:
         # 2. Si NO tiene face_embedding (Registro por primera vez)
         documentos = doc_data.get('documentosPersonales', {})
         
-        await _verificar_rostro_documento(worker_doc, documentos, 'ci', 'el carnet', analisis["embedding"], UMBRAL_SIMILITUD)
-        await _verificar_rostro_documento(worker_doc, documentos, 'licencia', 'la licencia', analisis["embedding"], UMBRAL_SIMILITUD)
+        await _verificar_rostro_documento(worker_doc, documentos, 'ci', 'el carnet', analisis["embedding"], SIMILARITY_THRESHOLD)
+        await _verificar_rostro_documento(worker_doc, documentos, 'licencia', 'la licencia', analisis["embedding"], SIMILARITY_THRESHOLD)
 
         # 3. Si todo sale bien (o ya estaban aprobados), guardamos la foto y el embedding inicial
         bucket = storage.bucket()
